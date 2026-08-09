@@ -21,7 +21,45 @@ if errorlevel 1 (
   exit /b 1
 )
 
-start "" "%~dp0dashboard.html"
+where git >nul 2>&1
+if errorlevel 1 (
+  echo.
+  echo Dashboard was built, but Git was not found. Nothing was uploaded.
+  pause
+  exit /b 1
+)
+
+pushd "%~dp0"
+git add --all
+git diff --cached --quiet
+if errorlevel 1 (
+  git commit -m "Update dashboard data"
+  if errorlevel 1 (
+    echo.
+    echo Git commit failed. Nothing was uploaded.
+    popd
+    pause
+    exit /b 1
+  )
+
+  git push origin main
+  if errorlevel 1 (
+    echo.
+    echo GitHub upload failed. Check the internet connection and try again.
+    popd
+    pause
+    exit /b 1
+  )
+  echo.
+  echo Dashboard generated and uploaded to GitHub successfully.
+) else (
+  echo.
+  echo Dashboard generated. There were no new changes to upload.
+)
+popd
+
+start "" "%~dp0index.html"
 echo.
-echo Dashboard generated successfully.
+echo You can close this window.
+pause
 endlocal
