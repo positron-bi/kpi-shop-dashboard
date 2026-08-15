@@ -7,7 +7,7 @@ import sys
 import unicodedata
 import zipfile
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from xml.etree import ElementTree as ET
 
@@ -180,10 +180,29 @@ def derive_period(month_value, year_value) -> tuple[str, str]:
     return month, year
 
 
+def derive_audit_date(date_value) -> tuple[str, str]:
+    """Return a stable period key and a readable date from one Excel date field."""
+    if isinstance(date_value, (int, float)) and date_value > 0:
+        audit_date = datetime(1899, 12, 30) + timedelta(days=float(date_value))
+        value = audit_date.strftime("%Y-%m-%d")
+        return value, value
+
+    clean = latin(date_value).strip().replace(".", "/").replace("-", "/")
+    match = re.search(r"((?:13|14|19|20)\d{2})/(\d{1,2})/(\d{1,2})", clean)
+    if not match:
+        return "", ""
+    year, month, day = (int(part) for part in match.groups())
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return "", ""
+    value = f"{year:04d}-{month:02d}-{day:02d}"
+    return value, value.replace("-", "/")
+
+
 def parse_audit(path: Path) -> dict:
     sheet_name, rows = read_sheet(path)
     header_row, columns = header_columns(rows)
     store = text_value(find_label(rows, {"نام فروشگاه", "فروشگاه"}))
+    audit_date_raw = find_label(rows, {"تاریخ آدیت", "تاریخ"})
     month_raw = find_label(rows, {"ماه"})
     year_raw = find_label(rows, {"سال"})
     evaluator = text_value(find_label(rows, {"ارزیاب", "فروشنده"}))
@@ -216,11 +235,16 @@ def parse_audit(path: Path) -> dict:
         if len(evaluations) == 55:
             break
 
+    period_key, audit_date = derive_audit_date(audit_date_raw)
     month, year = derive_period(month_raw, year_raw)
+    if not period_key and month and year:
+        month_index = MONTHS.index(month) + 1
+        period_key = f"{year}-{month_index:02d}"
+        audit_date = f"{month} {year}"
     if not store:
         raise ValueError("هدر «نام فروشگاه» داخل اکسل تکمیل نشده است.")
-    if not month or not year:
-        raise ValueError("هدر «ماه» یا «سال» داخل اکسل تکمیل نشده است.")
+    if not period_key:
+        raise ValueError("هدر «تاریخ آدیت» داخل اکسل تکمیل نشده یا فرمت تاریخ معتبر نیست.")
     if len(evaluations) != 55:
         raise ValueError(f"تعداد ردیف‌های شاخص {len(evaluations)} است؛ باید دقیقاً ۵۵ ردیف باشد.")
     incomplete = [index + 1 for index, item in enumerate(evaluations) if item["score"] not in {0, 1}]
@@ -243,14 +267,13 @@ def parse_audit(path: Path) -> dict:
             })
 
     passed = sum(item["score"] for item in evaluations)
-    month_index = MONTHS.index(month) + 1
     return {
-        "id": f"{normalized(store)}:{year}-{month_index:02d}",
+        "id": f"{normalized(store)}:{period_key}",
         "storeName": store,
         "month": month,
         "year": year,
-        "periodKey": f"{year}-{month_index:02d}",
-        "auditDate": f"{month} {year}",
+        "periodKey": period_key,
+        "auditDate": audit_date,
         "evaluator": evaluator,
         "supervisor": supervisor,
         "total": 55,
@@ -354,7 +377,7 @@ function metrics(){const latest=DATA.stores.map(s=>s.periods[0]).filter(Boolean)
 function renderStores(){const el=document.getElementById('storeList');if(!DATA.stores.length){el.innerHTML='<div class="empty">هنوز فایل اکسل کاملی داخل پوشه data قرار نگرفته است.</div>';return;}el.innerHTML=DATA.stores.map((s,i)=>{const p=s.periods[0];return `<button class="store-row ${s.id===selectedStoreId?'active':''}" onclick="chooseStore('${s.id}')"><span class="rank">${nf.format(i+1)}</span><span class="store-name"><strong>${esc(s.name)}</strong><small>${nf.format(s.periods.length)} دوره ثبت‌شده</small></span><span class="track"><i style="width:${p.readiness}%"></i></span><strong>${pf.format(p.readiness)}٪</strong><span class="pill ${p.issues.length?'bad':''}">${nf.format(p.issues.length)} مغایرت</span></button>`}).join('');}
 function chooseStore(id){selectedStoreId=id;selectedPeriodId=selectedStore()?.periods[0]?.id||'';render();}
 function choosePeriod(id){selectedPeriodId=id;renderOverview();renderDetails();renderTable();}
-function renderOverview(){const s=selectedStore(),p=selectedPeriod(),el=document.getElementById('overview');if(!s||!p){el.innerHTML='<div class="empty">داده‌ای برای نمایش وجود ندارد.</div>';return;}el.innerHTML=`<div class="title"><div><span class="eyebrow">فروشگاه منتخب</span><h2>${esc(s.name)}</h2></div><span class="count">${pf.format(p.readiness)}٪ آمادگی</span></div><div class="selectors"><label class="field"><span>فروشگاه</span><select onchange="chooseStore(this.value)">${DATA.stores.map(x=>`<option value="${x.id}" ${x.id===s.id?'selected':''}>${esc(x.name)}</option>`).join('')}</select></label><label class="field"><span>ماه / دوره</span><select onchange="choosePeriod(this.value)">${s.periods.map(x=>`<option value="${x.id}" ${x.id===p.id?'selected':''}>${esc(x.auditDate)}</option>`).join('')}</select></label></div><div class="facts"><div class="fact"><span>ارزیاب</span><strong>${esc(p.evaluator||'ثبت نشده')}</strong></div><div class="fact"><span>سرپرست</span><strong>${esc(p.supervisor||'ثبت نشده')}</strong></div><div class="fact"><span>امتیاز</span><strong>${nf.format(p.passed)} از ${nf.format(p.total)}</strong></div><div class="fact"><span>فایل منبع</span><strong title="${esc(p.sourceFile)}">${esc(p.sourceFile)}</strong></div></div>`;}
+function renderOverview(){const s=selectedStore(),p=selectedPeriod(),el=document.getElementById('overview');if(!s||!p){el.innerHTML='<div class="empty">داده‌ای برای نمایش وجود ندارد.</div>';return;}el.innerHTML=`<div class="title"><div><span class="eyebrow">فروشگاه منتخب</span><h2>${esc(s.name)}</h2></div><span class="count">${pf.format(p.readiness)}٪ آمادگی</span></div><div class="selectors"><label class="field"><span>فروشگاه</span><select onchange="chooseStore(this.value)">${DATA.stores.map(x=>`<option value="${x.id}" ${x.id===s.id?'selected':''}>${esc(x.name)}</option>`).join('')}</select></label><label class="field"><span>تاریخ / دوره</span><select onchange="choosePeriod(this.value)">${s.periods.map(x=>`<option value="${x.id}" ${x.id===p.id?'selected':''}>${esc(x.auditDate)}</option>`).join('')}</select></label></div><div class="facts"><div class="fact"><span>ارزیاب</span><strong>${esc(p.evaluator||'ثبت نشده')}</strong></div><div class="fact"><span>سرپرست</span><strong>${esc(p.supervisor||'ثبت نشده')}</strong></div><div class="fact"><span>امتیاز</span><strong>${nf.format(p.passed)} از ${nf.format(p.total)}</strong></div><div class="fact"><span>فایل منبع</span><strong title="${esc(p.sourceFile)}">${esc(p.sourceFile)}</strong></div></div>`;}
 function renderDetails(){const p=selectedPeriod(),el=document.getElementById('details');if(!p){el.innerHTML='';return;}const groups=p.groups.map(g=>{const ratio=g.total?g.passed/g.total*100:0;return `<div class="group-row"><div><strong>${esc(g.name)}</strong><small>${nf.format(g.passed)} از ${nf.format(g.total)}</small></div><div class="track"><i style="width:${ratio}%"></i></div><strong>${pf.format(ratio)}٪</strong></div>`}).join('');const issues=p.issues.length?p.issues.map((x,i)=>`<article class="issue"><strong>${nf.format(i+1)}. ${esc(x.indicator)}</strong><p>${esc(x.comment)}</p><small>${esc(x.group)}${x.status?' — '+esc(x.status):''}</small></article>`).join(''):'<div class="empty">در این دوره مغایرتی ثبت نشده است.</div>';el.innerHTML=`<article class="panel"><div class="title"><div><span class="eyebrow">نتیجه دوره</span><h2>امتیاز گروه‌های شاخص</h2></div></div><div class="group-list">${groups}</div></article><article class="panel"><div class="title"><div><span class="eyebrow">اقدامات اصلاحی</span><h2>مغایرت‌های این دوره</h2></div><span class="count">${nf.format(p.issues.length)} مورد</span></div><div class="issues">${issues}</div></article>`;}
 function renderTable(){const p=selectedPeriod(),el=document.getElementById('evaluationPanel');if(!p){el.innerHTML='';return;}const rows=p.evaluations.map((x,i)=>`<tr class="${x.score===0?'fail':''}"><td>${nf.format(i+1)}</td><td>${esc(x.code)}</td><td>${esc(x.group)}</td><td>${esc(x.indicator)}</td><td><span class="score">${nf.format(x.score)}</span></td><td>${esc(x.status||'—')}</td><td>${esc(x.comment||'—')}</td></tr>`).join('');el.innerHTML=`<div class="title"><div><span class="eyebrow">جزئیات کامل</span><h2>تمام ۵۵ ردیف ارزیابی — ${esc(p.auditDate)}</h2></div><span class="count">${nf.format(p.passed)} امتیاز</span></div><div class="table-wrap"><table><thead><tr><th>ردیف</th><th>کد</th><th>گروه</th><th>شاخص</th><th>امتیاز</th><th>وضعیت</th><th>توضیح</th></tr></thead><tbody>${rows}</tbody></table></div>`;}
 function renderWarnings(){const el=document.getElementById('warnings');el.innerHTML=DATA.warnings.length?`<div class="warning-box"><strong>توجه:</strong><br>${DATA.warnings.map(esc).join('<br>')}</div>`:'';}
