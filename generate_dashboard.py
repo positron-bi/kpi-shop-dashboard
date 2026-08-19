@@ -68,55 +68,56 @@ def shared_strings(archive: zipfile.ZipFile) -> list[str]:
     return values
 
 
-def first_sheet(archive: zipfile.ZipFile) -> tuple[str, str]:
+def workbook_sheets(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
     workbook = ET.fromstring(archive.read("xl/workbook.xml"))
-    sheet = workbook.find("m:sheets/m:sheet", NS)
-    if sheet is None:
+    sheets = workbook.findall("m:sheets/m:sheet", NS)
+    if not sheets:
         raise ValueError("فایل اکسل هیچ شیتی ندارد.")
-    rel_id = sheet.attrib[DOC_REL]
     relationships = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
-    target = None
-    for rel in relationships.findall("r:Relationship", REL_NS):
-        if rel.attrib.get("Id") == rel_id:
-            target = rel.attrib.get("Target")
-            break
-    if not target:
-        raise ValueError("مسیر شیت اول پیدا نشد.")
-    target_path = PurePosixPath(target.lstrip("/"))
-    if not str(target_path).startswith("xl/"):
-        target_path = PurePosixPath("xl") / target_path
-    return sheet.attrib.get("name", "Sheet1"), str(target_path)
+    targets = {rel.attrib.get("Id"): rel.attrib.get("Target") for rel in relationships.findall("r:Relationship", REL_NS)}
+    result = []
+    for sheet in sheets:
+        target = targets.get(sheet.attrib[DOC_REL])
+        if not target:
+            continue
+        target_path = PurePosixPath(target.lstrip("/"))
+        if not str(target_path).startswith("xl/"):
+            target_path = PurePosixPath("xl") / target_path
+        result.append((sheet.attrib.get("name", "Sheet1"), str(target_path)))
+    return result
 
 
-def read_sheet(path: Path) -> tuple[str, dict[int, dict[int, object]]]:
+def read_sheets(path: Path) -> list[tuple[str, dict[int, dict[int, object]]]]:
     with zipfile.ZipFile(path) as archive:
         strings = shared_strings(archive)
-        sheet_name, sheet_path = first_sheet(archive)
-        root = ET.fromstring(archive.read(sheet_path))
-        rows: dict[int, dict[int, object]] = defaultdict(dict)
-        for cell in root.findall(".//m:sheetData/m:row/m:c", NS):
-            ref = cell.attrib.get("r", "A1")
-            row_match = re.search(r"\d+", ref)
-            row_num = int(row_match.group(0)) if row_match else 1
-            col_num = column_number(ref)
-            cell_type = cell.attrib.get("t")
-            if cell_type == "inlineStr":
-                value = "".join(node.text or "" for node in cell.findall(".//m:is/m:t", NS))
-            else:
-                raw = cell.findtext("m:v", default="", namespaces=NS)
-                if cell_type == "s" and raw:
-                    value = strings[int(raw)]
-                elif cell_type in {"str", "b"}:
-                    value = raw
-                elif raw == "":
-                    value = ""
+        result = []
+        for sheet_name, sheet_path in workbook_sheets(archive):
+            root = ET.fromstring(archive.read(sheet_path))
+            rows: dict[int, dict[int, object]] = defaultdict(dict)
+            for cell in root.findall(".//m:sheetData/m:row/m:c", NS):
+                ref = cell.attrib.get("r", "A1")
+                row_match = re.search(r"\d+", ref)
+                row_num = int(row_match.group(0)) if row_match else 1
+                col_num = column_number(ref)
+                cell_type = cell.attrib.get("t")
+                if cell_type == "inlineStr":
+                    value = "".join(node.text or "" for node in cell.findall(".//m:is/m:t", NS))
                 else:
-                    try:
-                        value = float(raw)
-                    except ValueError:
+                    raw = cell.findtext("m:v", default="", namespaces=NS)
+                    if cell_type == "s" and raw:
+                        value = strings[int(raw)]
+                    elif cell_type in {"str", "b"}:
                         value = raw
-            rows[row_num][col_num] = value
-    return sheet_name, rows
+                    elif raw == "":
+                        value = ""
+                    else:
+                        try:
+                            value = float(raw)
+                        except ValueError:
+                            value = raw
+                rows[row_num][col_num] = value
+            result.append((sheet_name, rows))
+    return result
 
 
 def find_label(rows: dict[int, dict[int, object]], labels: set[str]):
@@ -180,7 +181,7 @@ def derive_period(month_value, year_value) -> tuple[str, str]:
     return month, year
 
 
-def derive_audit_date(date_value) -> tuple[str, str]:
+def derive_audit_date(date_value, sheet_name="", month_value="", year_value="", header_text="") -> tuple[str, str]:
     """Return a stable period key and a readable date from one Excel date field."""
     if isinstance(date_value, (int, float)) and date_value > 0:
         audit_date = datetime(1899, 12, 30) + timedelta(days=float(date_value))
@@ -190,7 +191,20 @@ def derive_audit_date(date_value) -> tuple[str, str]:
     clean = latin(date_value).strip().replace(".", "/").replace("-", "/")
     match = re.search(r"((?:13|14|19|20)\d{2})/(\d{1,2})/(\d{1,2})", clean)
     if not match:
-        return "", ""
+        combined = latin(f"{date_value} {sheet_name} {header_text}")
+        year_match = re.search(r"(?:13|14)\d{2}", combined)
+        year = int(year_match.group(0)) if year_match else 1405
+        month_text = text_value(month_value) or text_value(date_value)
+        month = next((item for item in MONTHS if item in month_text or item in text_value(sheet_name)), "")
+        day_match = re.search(r"(?<!\d)(\d{1,2})(?:\s*ام)?(?!\d)", latin(sheet_name))
+        if not month or not day_match:
+            return "", ""
+        day = int(day_match.group(1))
+        month_number = MONTHS.index(month) + 1
+        if not (1 <= day <= 31):
+            return "", ""
+        value = f"{year:04d}-{month_number:02d}-{day:02d}"
+        return value, value.replace("-", "/")
     year, month, day = (int(part) for part in match.groups())
     if not (1 <= month <= 12 and 1 <= day <= 31):
         return "", ""
@@ -198,10 +212,9 @@ def derive_audit_date(date_value) -> tuple[str, str]:
     return value, value.replace("-", "/")
 
 
-def parse_audit(path: Path) -> dict:
-    sheet_name, rows = read_sheet(path)
+def parse_audit(path: Path, sheet_name: str, rows: dict[int, dict[int, object]]) -> dict:
     header_row, columns = header_columns(rows)
-    store = text_value(find_label(rows, {"نام فروشگاه", "فروشگاه"}))
+    store = text_value(find_label(rows, {"نام فروشگاه", "فروشگاه"})) or path.stem
     audit_date_raw = find_label(rows, {"تاریخ آدیت", "تاریخ"})
     month_raw = find_label(rows, {"ماه"})
     year_raw = find_label(rows, {"سال"})
@@ -235,7 +248,8 @@ def parse_audit(path: Path) -> dict:
         if len(evaluations) == 55:
             break
 
-    period_key, audit_date = derive_audit_date(audit_date_raw)
+    header_text = " ".join(text_value(value) for row_num in sorted(rows) if row_num <= 3 for value in rows[row_num].values())
+    period_key, audit_date = derive_audit_date(audit_date_raw, sheet_name, month_raw, year_raw, header_text)
     month, year = derive_period(month_raw, year_raw)
     if not period_key and month and year:
         month_index = MONTHS.index(month) + 1
@@ -282,7 +296,7 @@ def parse_audit(path: Path) -> dict:
         "groups": list(groups.values()),
         "issues": issues,
         "evaluations": evaluations,
-        "sourceFile": path.name,
+        "sourceFile": f"{path.name} — {sheet_name}",
         "sourceMtime": path.stat().st_mtime,
     }
 
@@ -297,15 +311,21 @@ def collect_data() -> tuple[list[dict], list[str]]:
     )
     for path in files:
         try:
-            audit = parse_audit(path)
-            previous = periods_by_key.get(audit["id"])
-            if previous and previous["sourceMtime"] > audit["sourceMtime"]:
-                continue
-            if previous:
-                warnings.append(f"{path.name}: اطلاعات فروشگاه و دوره تکراری بود و نسخه جدیدتر جایگزین شد.")
-            periods_by_key[audit["id"]] = audit
+            sheets = read_sheets(path)
         except Exception as exc:
             warnings.append(f"{path.name}: {exc}")
+            continue
+        for sheet_name, rows in sheets:
+            try:
+                audit = parse_audit(path, sheet_name, rows)
+                previous = periods_by_key.get(audit["id"])
+                if previous and previous["sourceMtime"] > audit["sourceMtime"]:
+                    continue
+                if previous:
+                    warnings.append(f"{path.name} — {sheet_name}: اطلاعات فروشگاه و دوره تکراری بود و نسخه جدیدتر جایگزین شد.")
+                periods_by_key[audit["id"]] = audit
+            except Exception as exc:
+                warnings.append(f"{path.name} — {sheet_name}: {exc}")
 
     stores_map: dict[str, dict] = {}
     for audit in periods_by_key.values():
